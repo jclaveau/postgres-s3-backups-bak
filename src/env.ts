@@ -18,6 +18,11 @@ export const env = envsafe({
     default: '',
     allowEmpty: true,
   }),
+  PG_DUMP_EXTRA_ARGS: str({
+    desc: 'Extra pg_dump arguments, e.g. --exclude-table-data=directus_cache_stats_* to keep observability churn out of the dump and out of the server page cache.',
+    default: '',
+    allowEmpty: true,
+  }),
   RUN_ON_STARTUP: bool({
     desc: 'Run a backup on startup of this application',
     default: false,
