@@ -23,6 +23,11 @@ export const env = envsafe({
     default: '',
     allowEmpty: true,
   }),
+  EVICT_PAGE_CACHE_AFTER_DUMP: bool({
+    desc: 'After the dump, drop every relation of the dumped database from the server OS page cache with pgfincore, so the read-once pages stop being metered as container memory. Needs CREATE EXTENSION pgfincore on the server.',
+    default: false,
+    allowEmpty: true,
+  }),
   RUN_ON_STARTUP: bool({
     desc: 'Run a backup on startup of this application',
     default: false,

@@ -73,6 +73,37 @@ const dumpToFile = async (filePath: string) => {
   console.log("DB dumped to file...");
 }
 
+// A dump streams every relation file through the server's page cache, and a cgroup
+// keeps those pages until it is under pressure, so on a metered host they are paid
+// for until the next restart. pgfadvise_dontneed() gives them back right away; the
+// hot pages refault from disk once, the rest were read-once anyway.
+const evictPageCache = async () => {
+  console.log("Evicting the dumped relations from the server page cache...");
+
+  const relations = `
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+    where c.relkind in ('r', 'i', 't', 'm')
+      and n.nspname not in ('pg_catalog', 'information_schema')
+  `;
+  // Two statements: a single query gives no guarantee the measurement runs before the eviction.
+  const cachedSql = `select pg_size_pretty(sum(pages_mem * os_page_size)) from (select (pgfincore(c.oid::regclass)).* ${relations}) cached`;
+  const evictSql = `select count(*) from (select pgfadvise_dontneed(c.oid::regclass) ${relations}) evicted`;
+
+  await new Promise((resolve, reject) => {
+    exec(`psql --dbname=${env.BACKUP_DATABASE_URL} -X -v ON_ERROR_STOP=1 -tA -c "${cachedSql}" -c "${evictSql}"`, (error, stdout, stderr) => {
+      if (error) {
+        reject({ error: error, stderr: stderr.trimEnd() });
+        return;
+      }
+
+      const [size, count] = stdout.trim().split("\n");
+      console.log(`Evicted ${count} relation files, ${size} of page cache`);
+      resolve(undefined);
+    });
+  });
+}
+
 const deleteFile = async (path: string) => {
   console.log("Deleting file...");
   await new Promise((resolve, reject) => {
@@ -93,6 +124,9 @@ export const backup = async () => {
   const filepath = path.join(os.tmpdir(), filename);
 
   await dumpToFile(filepath);
+  if (env.EVICT_PAGE_CACHE_AFTER_DUMP) {
+    await evictPageCache();
+  }
   await uploadToS3({ name: filename, path: filepath });
   await deleteFile(filepath);
 
