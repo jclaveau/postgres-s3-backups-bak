@@ -24,7 +24,7 @@ export const env = envsafe({
     allowEmpty: true,
   }),
   EVICT_PAGE_CACHE_AFTER_DUMP: bool({
-    desc: 'After the dump, drop every relation of the dumped database from the server OS page cache with pgfincore, so the read-once pages stop being metered as container memory. Needs CREATE EXTENSION pgfincore on the server.',
+    desc: 'After the upload, drop the dumped relations from the server OS page cache with pgfincore, so the read-once pages stop being metered as container memory. Needs CREATE EXTENSION pgfincore on the server and a superuser connection.',
     default: false,
     allowEmpty: true,
   }),

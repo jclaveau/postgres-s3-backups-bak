@@ -80,20 +80,26 @@ const dumpToFile = async (filePath: string) => {
 const evictPageCache = async () => {
   console.log("Evicting the dumped relations from the server page cache...");
 
+  // TimescaleDB chunks are skipped: the hourly columnstore jobs drop and recreate them
+  // while this runs, and a relation gone between the listing and its turn aborts the
+  // statement. The cache-stats tables are skipped because they never leave shared_buffers.
   const relations = `
     from pg_class c
     join pg_namespace n on n.oid = c.relnamespace
     where c.relkind in ('r', 'i', 't', 'm')
-      and n.nspname not in ('pg_catalog', 'information_schema')
+      and n.nspname not in ('pg_catalog', 'information_schema', '_timescaledb_internal')
+      and c.relname not like 'directus_cache_stats%'
   `;
   // Two statements: a single query gives no guarantee the measurement runs before the eviction.
-  const cachedSql = `select pg_size_pretty(sum(pages_mem * os_page_size)) from (select (pgfincore(c.oid::regclass)).* ${relations}) cached`;
+  const cachedSql = `select pg_size_pretty(coalesce(sum(pages_mem * os_page_size), 0)) from (select (pgfincore(c.oid::regclass)).* ${relations}) cached`;
   const evictSql = `select count(*) from (select pgfadvise_dontneed(c.oid::regclass) ${relations}) evicted`;
 
-  await new Promise((resolve, reject) => {
+  await new Promise((resolve) => {
     exec(`psql --dbname=${env.BACKUP_DATABASE_URL} -X -v ON_ERROR_STOP=1 -tA -c "${cachedSql}" -c "${evictSql}"`, (error, stdout, stderr) => {
+      // The backup is already in S3 at this point; a failed eviction is worth a log line, not a failed run.
       if (error) {
-        reject({ error: error, stderr: stderr.trimEnd() });
+        console.error("Page cache eviction failed: ", { error: error, stderr: stderr.trimEnd() });
+        resolve(undefined);
         return;
       }
 
@@ -124,11 +130,11 @@ export const backup = async () => {
   const filepath = path.join(os.tmpdir(), filename);
 
   await dumpToFile(filepath);
+  await uploadToS3({ name: filename, path: filepath });
+  await deleteFile(filepath);
   if (env.EVICT_PAGE_CACHE_AFTER_DUMP) {
     await evictPageCache();
   }
-  await uploadToS3({ name: filename, path: filepath });
-  await deleteFile(filepath);
 
   console.log("DB backup complete...");
 }
