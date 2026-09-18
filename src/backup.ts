@@ -41,7 +41,7 @@ const dumpToFile = async (filePath: string) => {
 
   await new Promise((resolve, reject) => {
     // Without pipefail the pipeline reports gzip's status, masking a failed pg_dump.
-    exec(`set -o pipefail; pg_dump --dbname=${env.BACKUP_DATABASE_URL} --format=tar | gzip > ${filePath}`, (error, stdout, stderr) => {
+    exec(`set -o pipefail; pg_dump --dbname=${env.BACKUP_DATABASE_URL} --format=tar ${env.PG_DUMP_EXTRA_ARGS} | gzip > ${filePath}`, (error, stdout, stderr) => {
       if (error) {
         reject({ error: error, stderr: stderr.trimEnd() });
         return;
@@ -74,6 +74,43 @@ const dumpToFile = async (filePath: string) => {
   console.log("DB dumped to file...");
 }
 
+// A dump streams every relation file through the server's page cache, and a cgroup
+// keeps those pages until it is under pressure, so on a metered host they are paid
+// for until the next restart. pgfadvise_dontneed() gives them back right away; the
+// hot pages refault from disk once, the rest were read-once anyway.
+const evictPageCache = async () => {
+  console.log("Evicting the dumped relations from the server page cache...");
+
+  // TimescaleDB chunks are skipped: the hourly columnstore jobs drop and recreate them
+  // while this runs, and a relation gone between the listing and its turn aborts the
+  // statement. The cache-stats tables are skipped because they never leave shared_buffers.
+  const relations = `
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+    where c.relkind in ('r', 'i', 't', 'm')
+      and n.nspname not in ('pg_catalog', 'information_schema', '_timescaledb_internal')
+      and c.relname not like 'directus_cache_stats%'
+  `;
+  // Two statements: a single query gives no guarantee the measurement runs before the eviction.
+  const cachedSql = `select pg_size_pretty(coalesce(sum(pages_mem * os_page_size), 0)) from (select (pgfincore(c.oid::regclass)).* ${relations}) cached`;
+  const evictSql = `select count(*) from (select pgfadvise_dontneed(c.oid::regclass) ${relations}) evicted`;
+
+  await new Promise((resolve) => {
+    exec(`psql --dbname=${env.BACKUP_DATABASE_URL} -X -v ON_ERROR_STOP=1 -tA -c "${cachedSql}" -c "${evictSql}"`, (error, stdout, stderr) => {
+      // The backup is already in S3 at this point; a failed eviction is worth a log line, not a failed run.
+      if (error) {
+        console.error("Page cache eviction failed: ", { error: error, stderr: stderr.trimEnd() });
+        resolve(undefined);
+        return;
+      }
+
+      const [size, count] = stdout.trim().split("\n");
+      console.log(`Evicted ${count} relation files, ${size} of page cache`);
+      resolve(undefined);
+    });
+  });
+}
+
 const deleteFile = async (path: string) => {
   console.log("Deleting file...");
   await new Promise((resolve, reject) => {
@@ -96,6 +133,9 @@ export const backup = async () => {
   await dumpToFile(filepath);
   await uploadToS3({ name: filename, path: filepath });
   await deleteFile(filepath);
+  if (env.EVICT_PAGE_CACHE_AFTER_DUMP) {
+    await evictPageCache();
+  }
 
   console.log("DB backup complete...");
 }
